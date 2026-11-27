@@ -95,6 +95,23 @@ SOFT_PENALTY_KEYWORDS = [
     "琵琶",
 ]
 
+MUSIC_GOOD_TYPENAMES = {
+    "mv",
+    "音乐综合",
+    "原创音乐",
+    "音乐分享官",
+}
+
+MUSIC_EXCLUDE_TYPENAMES = {
+    "翻唱",
+    "音乐现场",
+    "乐评盘点",
+    "演奏",
+    "音乐教学",
+    "鬼畜调教",
+    "音mad",
+}
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _NON_WORD_RE = re.compile(r"[^\w\u4e00-\u9fff]+", re.UNICODE)
 
@@ -110,6 +127,7 @@ class VideoCandidate:
     aid: int = 0
     description: str = ""
     tag: str = ""
+    typename: str = ""
     score: float = 0.0
     badges: List[str] = field(default_factory=list)
     excluded: bool = False
@@ -211,6 +229,33 @@ def rank_candidates(
 
         title_lower = clean_title.lower()
         meta_lower = f"{title_lower} {c.tag.lower()}"
+        tname_lower = (c.typename or "").strip().lower()
+
+        # 0. Partition check: reject non-music or cover/live partitions unless user explicitly asked
+        if tname_lower:
+            if tname_lower in MUSIC_EXCLUDE_TYPENAMES:
+                allow_this = (
+                    (tname_lower == "翻唱" and ("翻唱" in query_lower or "cover" in query_lower))
+                    or (tname_lower == "音乐现场" and ("现场" in query_lower or "live" in query_lower))
+                    or (tname_lower == "演奏" and any(k in query_lower for k in ("钢琴", "吉他", "演奏", "纯音乐")))
+                )
+                if not allow_this:
+                    c.excluded = True
+                    c.exclude_reason = f"分区排除:{c.typename}"
+                    c.score = -600.0 + math.log10(max(c.play, 1)) * 5.0
+                    excluded_list.append(c)
+                    continue
+            elif tname_lower not in MUSIC_GOOD_TYPENAMES:
+                has_music_signal = any(
+                    kw in meta_lower
+                    for kw in (LOSSLESS_KEYWORDS + ["歌曲", "原唱", "纯享", "动态歌词", "歌词版", "mv", "mtv"])
+                )
+                if not has_music_signal:
+                    c.excluded = True
+                    c.exclude_reason = f"非音乐分区:{c.typename}"
+                    c.score = -800.0 + math.log10(max(c.play, 1)) * 2.0
+                    excluded_list.append(c)
+                    continue
 
         # 1. Hard check: title must contain song name
         if not _title_matches_song(clean_title, song_name):
@@ -265,6 +310,9 @@ def rank_candidates(
         # 4. Positive scoring
         play_weight = 18.0 if mode == "views_first" else 12.0
         score = math.log10(max(c.play, 1)) * play_weight
+
+        if tname_lower in MUSIC_GOOD_TYPENAMES:
+            score += 10.0
 
         if c.play >= 500_000:
             c.badges.append("高播放")

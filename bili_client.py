@@ -138,7 +138,13 @@ class BiliClient:
 
             self._initialized = True
 
-    def _search_once(self, keyword: str, order: str = "click", page: int = 1) -> List[VideoCandidate]:
+    def _search_once(
+        self,
+        keyword: str,
+        order: str = "click",
+        page: int = 1,
+        tids: Optional[int] = None,
+    ) -> List[VideoCandidate]:
         self.ensure_session()
         base_params: Dict[str, str | int] = {
             "search_type": "video",
@@ -146,6 +152,8 @@ class BiliClient:
             "order": order,
             "page": page,
         }
+        if tids is not None:
+            base_params["tids"] = tids
         data = None
         if self._wbi_keys:
             try:
@@ -189,6 +197,7 @@ class BiliClient:
                     duration_str=dur_str,
                     description=strip_html(str(item.get("description") or "")),
                     tag=str(item.get("tag") or ""),
+                    typename=str(item.get("typename") or ""),
                 )
             )
         return out
@@ -206,14 +215,25 @@ class BiliClient:
 
         primary_kw = f"{song_name} {artist}".strip()
         results: List[VideoCandidate] = []
-        results.extend(self._search_once(primary_kw, order="click", page=1))
 
+        # 1. Music partition (tids=3) sorted by most views & default relevance
+        for order in ("click", "totalrank"):
+            try:
+                results.extend(self._search_once(primary_kw, order=order, page=1, tids=3))
+            except Exception:
+                pass
+
+        # 2. Lossless-specific relevance search (catches Hi-Res uploads even for common idiom titles)
         if lossless_first:
             lossless_kw = f"{song_name} {artist} 无损".strip() if artist else f"{song_name} 无损"
             try:
-                results.extend(self._search_once(lossless_kw, order="click", page=1))
+                results.extend(self._search_once(lossless_kw, order="totalrank", page=1))
             except Exception:
                 pass
+
+        # 3. Fallback to site-wide relevance search only if music partition returned nothing
+        if not results:
+            results.extend(self._search_once(primary_kw, order="totalrank", page=1))
         return results
 
     def get_video_info(self, bvid: str) -> dict:

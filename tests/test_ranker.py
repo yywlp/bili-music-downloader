@@ -54,6 +54,17 @@ class TestRanker(unittest.TestCase):
         self.assertEqual(len(ranked), 1)
         self.assertFalse(ranked[0].excluded)
 
+    def test_idiom_song_title_filters_non_music_partitions(self):
+        candidates = [
+            VideoCandidate("BV1uiM66", "当代妈妈的蜜汁操作（妈妈用心良苦的教会了孩子怎么打爹！）", "萧枭同学", 1940000, 169, "2:49", typename="搞笑"),
+            VideoCandidate("BV1PL411", "《用心良苦的厨子和他油盐不进的老弟》", "李哥我饿了", 1278000, 142, "2:22", typename="日常"),
+            VideoCandidate("BV1BB4y1", "【4K修复.Live'97】张宇《用心良苦》", "某UP", 873238, 268, "4:28", typename="音乐现场"),
+            VideoCandidate("BV1hZ421", "【无损音质】张宇《用心良苦》高音质无损音乐车载经典畅听站", "繁华落尽的恋曲e", 230502, 276, "4:36", typename="音乐综合"),
+            VideoCandidate("BV1cndDY", "【Hi-Res无损音质】张宇《用心良苦》这歌原来这么好听！经典歌曲", "某UP", 101661, 273, "4:33", typename="MV"),
+        ]
+        ranked = rank_candidates(candidates, "用心良苦", mode="lossless_first", allow_fallback=False)
+        self.assertEqual([c.bvid for c in ranked], ["BV1hZ421", "BV1cndDY"])
+
 
 if __name__ == "__main__":
     unittest.main()
