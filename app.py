@@ -20,7 +20,14 @@ from bili_client import BiliClient
 from config import AppSettings, get_playlists_path, get_resource_path, load_settings, save_settings
 from converter import export_audio, probe_mp3_summary, resolve_output_path, sanitize_filename
 from playlist_importer import fetch_netease_playlist
-from playlist_store import LocalTrack, PlaylistStore, format_size, list_track_folders, scan_local_tracks
+from playlist_store import (
+    LocalTrack,
+    PlaylistStore,
+    format_size,
+    list_track_folders,
+    move_to_recycle_bin,
+    scan_local_tracks,
+)
 from ranker import VideoCandidate, format_duration, format_play_count, rank_candidates
 
 # Brand palette (Bilibili Sakura Pink + Sky Blue + Fluent Neutrals)
@@ -789,7 +796,7 @@ class BiliMusicApp(ctk.CTk):
         ctk.CTkButton(
             top_filter,
             text="刷新曲库",
-            width=84,
+            width=80,
             height=32,
             corner_radius=8,
             font=self.font_small,
@@ -798,6 +805,19 @@ class BiliMusicApp(ctk.CTk):
             text_color=("#374151", "#E5E7EB"),
             command=self._refresh_local_library,
         ).pack(side="right")
+
+        ctk.CTkButton(
+            top_filter,
+            text="删除选中",
+            width=80,
+            height=32,
+            corner_radius=8,
+            font=self.font_small,
+            fg_color=("#FEE2E2", "#451A1A"),
+            hover_color=("#FECACA", "#612424"),
+            text_color=("#DC2626", "#FCA5A5"),
+            command=self._prompt_delete_selected_tracks,
+        ).pack(side="right", padx=(0, 8))
 
         self.lib_filter_entry = ctk.CTkEntry(
             top_filter,
@@ -846,6 +866,7 @@ class BiliMusicApp(ctk.CTk):
 
         self.local_tree.bind("<Double-1>", lambda _e: self._play_selected_local())
         self.local_tree.bind("<Button-3>", self._show_local_menu)
+        self.local_tree.bind("<Delete>", lambda _e: self._prompt_delete_selected_tracks())
 
     # ---------- Styling & Theme ----------
     def _apply_treeview_style(self) -> None:
@@ -1232,6 +1253,7 @@ class BiliMusicApp(ctk.CTk):
                 command=lambda p=pl_name, trs=selected: self._remove_tracks_from_playlist(p, trs),
             )
 
+        menu.add_command(label="删除歌曲...", command=self._prompt_delete_selected_tracks)
         menu.add_separator()
         menu.add_command(label="在资源管理器中定位文件", command=lambda t=selected[0]: self._reveal_in_explorer(t.path))
         menu.tk_popup(event.x_root, event.y_root)
@@ -1252,6 +1274,152 @@ class BiliMusicApp(ctk.CTk):
         self._render_sidebar()
         self._render_local_tracks()
         self._set_status(f"已从歌单「{pl_name}」移除 {removed} 首歌曲")
+
+    def _prompt_delete_selected_tracks(self) -> None:
+        tracks = self._get_selected_local_tracks()
+        if not tracks:
+            messagebox.showinfo("提示", "请先在列表中选择要删除的歌曲（支持按 Ctrl/Shift 多选）。")
+            return
+
+        kind, view_name = self._current_library_view
+        is_custom_pl = kind == "playlist"
+
+        win = ctk.CTkToplevel(self)
+        win.title("删除歌曲")
+        win.geometry("460x235")
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()
+
+        ico_path = get_resource_path("assets/app.ico")
+        if ico_path.is_file():
+            try:
+                win.after(100, lambda: win.iconbitmap(str(ico_path)))
+            except Exception:
+                pass
+
+        card = ctk.CTkFrame(win, corner_radius=14, fg_color=(LIGHT_CARD, DARK_CARD))
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        if len(tracks) == 1:
+            headline = f"确定要删除「{tracks[0].name}」吗？"
+        else:
+            headline = f"确定要删除选中的 {len(tracks)} 首歌曲吗？"
+
+        ctk.CTkLabel(
+            card,
+            text=headline,
+            font=self.font_bold,
+            wraplength=400,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(16, 8))
+
+        delete_local_var = tk.BooleanVar(value=(not is_custom_pl))
+        cb_text = "同时删除本地音频文件（移入 Windows 回收站，可还原）"
+        ctk.CTkCheckBox(
+            card,
+            text=cb_text,
+            variable=delete_local_var,
+            font=self.font_small,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color="#DC2626",
+            hover_color="#B91C1C",
+        ).pack(anchor="w", padx=16, pady=(4, 6))
+
+        hint_text = (
+            f"不勾选时，仅从自定义歌单「{view_name}」中移除，保留硬盘文件。"
+            if is_custom_pl
+            else "不勾选时，仅清理所有自定义歌单中的引用记录，保留硬盘上的音频文件。"
+        )
+        ctk.CTkLabel(
+            card,
+            text=hint_text,
+            font=self.font_small,
+            text_color=("#6B7280", "#9CA3AF"),
+            wraplength=400,
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(2, 16))
+
+        def on_confirm() -> None:
+            del_local = delete_local_var.get()
+            win.destroy()
+            self._execute_delete_tracks(tracks, delete_local=del_local)
+
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkButton(
+            btn_row,
+            text="取消",
+            width=84,
+            height=34,
+            corner_radius=8,
+            fg_color=("#F3F4F6", "#2A2E3B"),
+            hover_color=("#E5E7EB", "#363C4D"),
+            text_color=("#374151", "#E5E7EB"),
+            command=win.destroy,
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            btn_row,
+            text="确认删除",
+            width=96,
+            height=34,
+            corner_radius=8,
+            font=self.font_bold,
+            fg_color="#DC2626",
+            hover_color="#B91C1C",
+            command=on_confirm,
+        ).pack(side="right")
+
+    def _execute_delete_tracks(self, tracks: List[LocalTrack], delete_local: bool) -> None:
+        paths = [t.path for t in tracks]
+        norm_set = {str(Path(p).resolve()).lower() for p in paths}
+        kind, view_name = self._current_library_view
+
+        if not delete_local:
+            if kind == "playlist":
+                removed = self.playlist_store.remove_tracks(view_name, paths)
+                self._render_sidebar()
+                self._render_local_tracks()
+                self._set_status(f"已从歌单「{view_name}」移除 {removed} 首歌曲（已保留本地文件）")
+            else:
+                removed = self.playlist_store.remove_tracks_from_all(paths)
+                self._render_sidebar()
+                self._set_status(f"已清理 {removed} 条自定义歌单记录（已保留本地文件）")
+            return
+
+        # Release playback handle if currently playing any of the target files
+        snap = self.player.get_snapshot()
+        if snap.current_path and str(Path(snap.current_path).resolve()).lower() in norm_set:
+            self.player.release_file()
+            self.now_playing_var.set("未播放 · 当前歌曲已删除")
+            self.seek_slider.set(0)
+            self.time_cur_var.set("00:00")
+            self.time_tot_var.set("00:00")
+            self._last_duration = 0.0
+
+        ok_paths: List[str] = []
+        failed: List[str] = []
+        for t in tracks:
+            ok, msg = move_to_recycle_bin(t.path)
+            if ok:
+                ok_paths.append(t.path)
+            else:
+                failed.append(f"{t.name} ({msg})")
+
+        if ok_paths:
+            self.playlist_store.remove_tracks_from_all(ok_paths)
+            ok_norm = {str(Path(p).resolve()).lower() for p in ok_paths}
+            self.play_queue = [q for q in self.play_queue if str(Path(q.path).resolve()).lower() not in ok_norm]
+            if self.current_play_index >= len(self.play_queue):
+                self.current_play_index = -1
+
+        self._refresh_local_library()
+        if failed:
+            self._set_status(f"已移入回收站 {len(ok_paths)} 首，失败 {len(failed)} 首")
+            messagebox.showwarning("部分删除失败", "以下文件未能删除：\n" + "\n".join(failed[:8]))
+        else:
+            self._set_status(f"已将 {len(ok_paths)} 首歌曲移入回收站并同步更新歌单")
 
     def _reveal_in_explorer(self, path: str) -> None:
         if os.name == "nt" and Path(path).exists():

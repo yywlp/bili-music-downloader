@@ -1,11 +1,57 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".flac", ".wav"}
+
+
+def move_to_recycle_bin(file_path: str | Path) -> Tuple[bool, str]:
+    """Safely move a file to Windows Recycle Bin using SHFileOperationW (fallback to unlink on non-Windows)."""
+    p = Path(file_path)
+    if not p.exists():
+        return True, "文件已不存在"
+
+    if os.name != "nt":
+        try:
+            p.unlink()
+            return True, "OK"
+        except Exception as exc:
+            return False, str(exc)
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.wintypes.HWND),
+            ("wFunc", ctypes.wintypes.UINT),
+            ("pFrom", ctypes.wintypes.LPCWSTR),
+            ("pTo", ctypes.wintypes.LPCWSTR),
+            ("fFlags", ctypes.c_ushort),
+            ("fAnyOperationsAborted", ctypes.wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.wintypes.LPCWSTR),
+        ]
+
+    fo_delete = 0x0003
+    fof_silent = 0x0004
+    fof_noconfirmation = 0x0010
+    fof_allowundo = 0x0040
+    fof_noerrorui = 0x0400
+
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = fo_delete
+    # Double-null-terminated path list required by SHFileOperationW
+    op.pFrom = str(p.resolve()) + "\0\0"
+    op.fFlags = fof_allowundo | fof_noconfirmation | fof_silent | fof_noerrorui
+
+    res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if res == 0 and not p.exists():
+        return True, "OK"
+    return False, f"移入回收站失败 (code={res})"
 
 
 @dataclass
@@ -155,6 +201,19 @@ class PlaylistStore:
             self._playlists[playlist_name] = kept
             self.save()
         return removed
+
+    def remove_tracks_from_all(self, track_paths: List[str]) -> int:
+        remove_set = {str(Path(p).resolve()).lower() for p in track_paths}
+        total_removed = 0
+        for name, old in list(self._playlists.items()):
+            kept = [p for p in old if str(Path(p).resolve()).lower() not in remove_set]
+            diff = len(old) - len(kept)
+            if diff > 0:
+                self._playlists[name] = kept
+                total_removed += diff
+        if total_removed > 0:
+            self.save()
+        return total_removed
 
     def get_tracks(self, playlist_name: str, existing_only: bool = True) -> List[LocalTrack]:
         raw_paths = self._playlists.get(playlist_name) or []

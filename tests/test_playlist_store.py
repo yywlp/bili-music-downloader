@@ -54,6 +54,25 @@ class TestPlaylistStore(unittest.TestCase):
             self.assertTrue(reloaded.delete_playlist("通勤精选"))
             self.assertEqual(reloaded.list_playlists(), [])
 
+    def test_remove_tracks_from_all_playlists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            f1 = root / "歌A.m4a"
+            f2 = root / "歌B.mp3"
+            f1.write_bytes(b"1")
+            f2.write_bytes(b"2")
+
+            store = PlaylistStore(root / "playlists.json")
+            store.create_playlist("歌单1")
+            store.create_playlist("歌单2")
+            store.add_tracks("歌单1", [str(f1), str(f2)])
+            store.add_tracks("歌单2", [str(f1)])
+
+            removed = store.remove_tracks_from_all([str(f1)])
+            self.assertEqual(removed, 2)
+            self.assertEqual([t.name for t in store.get_tracks("歌单1")], ["歌B"])
+            self.assertEqual(store.get_tracks("歌单2"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -76,6 +76,11 @@ class LocalAudioPlayer:
     def stop(self) -> None:
         self._cmd_q.put(("stop", None))
 
+    def release_file(self, timeout: float = 1.5) -> None:
+        done = threading.Event()
+        self._cmd_q.put(("release", done))
+        done.wait(timeout=timeout)
+
     def seek(self, seconds: float) -> None:
         self._cmd_q.put(("seek", max(0.0, float(seconds))))
 
@@ -163,6 +168,22 @@ class LocalAudioPlayer:
                     with self._lock:
                         self._snapshot.state = "stopped"
                         self._snapshot.position_sec = 0.0
+                elif cmd == "release":
+                    user_stopped = True
+                    ended_fired = True
+                    try:
+                        wmp.controls.stop()
+                        wmp.URL = ""
+                        wmp.close()
+                    except Exception:
+                        pass
+                    with self._lock:
+                        self._snapshot.current_path = ""
+                        self._snapshot.state = "stopped"
+                        self._snapshot.position_sec = 0.0
+                        self._snapshot.duration_sec = 0.0
+                    if isinstance(arg, threading.Event):
+                        arg.set()
                 elif cmd == "seek" and arg is not None:
                     try:
                         wmp.controls.currentPosition = float(arg)
