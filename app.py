@@ -15,7 +15,8 @@ from PIL import Image
 
 from bili_client import BiliClient
 from config import AppSettings, get_resource_path, load_settings, save_settings
-from converter import convert_to_mp3, probe_mp3_summary, resolve_output_path
+from converter import convert_to_mp3, probe_mp3_summary, resolve_output_path, sanitize_filename
+from playlist_importer import fetch_netease_playlist
 from ranker import VideoCandidate, format_play_count, rank_candidates
 
 # Brand palette (Bilibili Sakura Pink + Sky Blue + Fluent Neutrals)
@@ -72,6 +73,7 @@ class BiliMusicApp(ctk.CTk):
         self._cancel_event = threading.Event()
         self._last_song_query = ""
         self._last_artist_query = ""
+        self._imported_playlist_name = ""
         self._theme_mode = "Light"
         self._logo_image: Optional[ctk.CTkImage] = None
 
@@ -426,13 +428,84 @@ class BiliMusicApp(ctk.CTk):
         self.dl_selected_btn.pack(side="right")
 
     def _build_batch_tab(self) -> None:
-        hint = ctk.CTkLabel(
+        # NetEase Playlist Import Bar
+        import_bar = ctk.CTkFrame(
             self.batch_tab,
-            text="每行输入一首歌（支持「歌名」或「歌名 - 歌手」格式），程序将自动选出第 1 名并保存为「歌曲名.mp3」：",
-            font=self.font_small,
-            text_color=("#4B5563", "#9CA3AF"),
+            corner_radius=12,
+            fg_color=("#F8FAFC", "#181B24"),
+            border_width=1,
+            border_color=(LIGHT_BORDER, DARK_BORDER),
         )
-        hint.pack(anchor="w", padx=10, pady=(6, 8))
+        import_bar.pack(fill="x", padx=10, pady=(8, 8))
+
+        imp_row1 = ctk.CTkFrame(import_bar, fg_color="transparent")
+        imp_row1.pack(fill="x", padx=12, pady=(10, 6))
+
+        ctk.CTkLabel(
+            imp_row1,
+            text="导入网易云歌单：",
+            font=self.font_bold,
+            text_color=("#1F2937", "#F3F4F6"),
+        ).pack(side="left", padx=(0, 8))
+
+        self.playlist_entry = ctk.CTkEntry(
+            imp_row1,
+            placeholder_text="直接粘贴网易云歌单分享文案、链接（music.163.com/...）或纯歌单 ID",
+            height=34,
+            corner_radius=8,
+            font=self.font_small,
+            border_color=("#D1D5DB", "#374151"),
+        )
+        self.playlist_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.playlist_entry.bind("<Return>", lambda _e: self._start_import_playlist())
+
+        self.import_btn = ctk.CTkButton(
+            imp_row1,
+            text="解析导入",
+            width=96,
+            height=34,
+            corner_radius=8,
+            font=self.font_bold,
+            fg_color=BLUE,
+            hover_color=BLUE_HOVER,
+            command=self._start_import_playlist,
+        )
+        self.import_btn.pack(side="right")
+
+        imp_row2 = ctk.CTkFrame(import_bar, fg_color="transparent")
+        imp_row2.pack(fill="x", padx=12, pady=(0, 10))
+
+        self.use_subfolder_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            imp_row2,
+            text="按歌单名自动建子文件夹",
+            variable=self.use_subfolder_var,
+            font=self.font_small,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=PINK,
+            hover_color=PINK_HOVER,
+        ).pack(side="left", padx=(0, 18))
+
+        self.strict_match_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            imp_row2,
+            text="严格匹配（B站搜不到对应纯单曲则跳过，不乱下）",
+            variable=self.strict_match_var,
+            font=self.font_small,
+            checkbox_width=18,
+            checkbox_height=18,
+            fg_color=PINK,
+            hover_color=PINK_HOVER,
+        ).pack(side="left")
+
+        self.playlist_info_var = tk.StringVar(value="")
+        ctk.CTkLabel(
+            imp_row2,
+            textvariable=self.playlist_info_var,
+            font=self.font_small,
+            text_color=("#0284C7", "#7DD3FC"),
+        ).pack(side="right")
 
         split = ctk.CTkFrame(self.batch_tab, fg_color="transparent")
         split.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -449,7 +522,7 @@ class BiliMusicApp(ctk.CTk):
             fg_color=("#FAFBFD", "#181B24"),
         )
         self.batch_input.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self.batch_input.insert("end", "# 示例（带 # 的行会自动忽略）：\n# 青花瓷 - 周杰伦\n# 兰亭序\n")
+        self.batch_input.insert("end", "# 可在上方直接粘贴网易云歌单导入，或手动每行输入一首：\n# 青花瓷 - 周杰伦\n# 兰亭序\n")
 
         self.batch_log = ctk.CTkTextbox(
             split,
@@ -475,7 +548,7 @@ class BiliMusicApp(ctk.CTk):
             fg_color=("#F3F4F6", "#2A2E3B"),
             hover_color=("#E5E7EB", "#363C4D"),
             text_color=("#374151", "#E5E7EB"),
-            command=lambda: self.batch_input.delete("1.0", "end"),
+            command=self._clear_batch_input,
         ).pack(side="left")
 
         self.batch_start_btn = ctk.CTkButton(
@@ -551,6 +624,7 @@ class BiliMusicApp(ctk.CTk):
         self.quick_btn.configure(state=state)
         self.dl_selected_btn.configure(state=state)
         self.batch_start_btn.configure(state=state)
+        self.import_btn.configure(state=state)
         self.cancel_btn.configure(state="normal" if busy else "disabled")
         if not busy:
             self._cancel_event.clear()
@@ -824,9 +898,10 @@ class BiliMusicApp(ctk.CTk):
         song_name: str,
         artist_name: str,
         status_prefix: str = "",
+        target_dir: Optional[str] = None,
     ) -> Tuple[str, Optional[Path], str]:
         out_path, skipped = resolve_output_path(
-            self.settings.download_dir,
+            target_dir or self.settings.download_dir,
             song_name,
             conflict_policy=self.settings.conflict_policy,
         )
@@ -908,15 +983,71 @@ class BiliMusicApp(ctk.CTk):
         self._set_status(f"下载失败：{err}", 0)
         messagebox.showerror("下载失败", err)
 
-    # ---------- Batch Download ----------
+    # ---------- NetEase Playlist Import & Batch Download ----------
+    def _clear_batch_input(self) -> None:
+        self.batch_input.delete("1.0", "end")
+        self._imported_playlist_name = ""
+        self.playlist_info_var.set("")
+
+    def _start_import_playlist(self) -> None:
+        if self._busy:
+            return
+        raw = self.playlist_entry.get().strip()
+        if not raw:
+            messagebox.showwarning("提示", "请先粘贴网易云歌单分享文案、链接或纯歌单 ID。")
+            return
+
+        self._cancel_event.clear()
+        self._set_busy(True)
+        self._set_status("正在解析网易云歌单曲目列表...", 15)
+        threading.Thread(target=self._worker_import_playlist, args=(raw,), daemon=True).start()
+
+    def _worker_import_playlist(self, raw_text: str) -> None:
+        def on_prog(done: int, total: int) -> None:
+            if total > 0:
+                pct = 15.0 + (done / total) * 80.0
+                self.after(0, lambda d=done, t=total, p=pct: self._set_status(f"正在展开网易云歌单曲目 ({d}/{t})...", p))
+
+        try:
+            pl = fetch_netease_playlist(raw_text, progress_cb=on_prog)
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): self._on_import_error(e))
+            return
+
+        lines = [f"# 网易云歌单：{pl.name}（共 {len(pl.tracks)} 首）"]
+        for t in pl.tracks:
+            lines.append(f"{t.name} - {t.artist}" if t.artist else t.name)
+        joined = "\n".join(lines) + "\n"
+
+        def apply_ui() -> None:
+            self._imported_playlist_name = pl.name
+            self.playlist_info_var.set(f"已导入：{pl.name}（{len(pl.tracks)} 首）")
+            self.batch_input.delete("1.0", "end")
+            self.batch_input.insert("end", joined)
+            self._finish_single_idle(
+                f"成功导入网易云歌单《{pl.name}》（共 {len(pl.tracks)} 首），可删改后点「开始批量下载」。", 100
+            )
+
+        self.after(0, apply_ui)
+
+    def _on_import_error(self, err: str) -> None:
+        self._set_busy(False)
+        self._set_status(f"歌单导入失败：{err}", 0)
+        messagebox.showerror("导入失败", err)
+
     def _start_batch_download(self) -> None:
         if self._busy:
             return
         raw_text = self.batch_input.get("1.0", "end")
         tasks = [parsed for line in raw_text.splitlines() if (parsed := parse_batch_line(line))]
         if not tasks:
-            messagebox.showwarning("提示", "请先在左侧输入至少一首歌曲名。")
+            messagebox.showwarning("提示", "请先在左侧输入或导入至少一首歌曲。")
             return
+
+        target_dir = self.settings.download_dir
+        if self.use_subfolder_var.get() and self._imported_playlist_name:
+            sub = sanitize_filename(self._imported_playlist_name)
+            target_dir = str(Path(self.settings.download_dir) / sub)
 
         self._cancel_event.clear()
         self._set_busy(True)
@@ -925,18 +1056,31 @@ class BiliMusicApp(ctk.CTk):
         self.batch_log.configure(state="disabled")
 
         mode = self._current_rank_mode()
-        threading.Thread(target=self._worker_batch, args=(tasks, mode), daemon=True).start()
+        strict = self.strict_match_var.get()
+        threading.Thread(
+            target=self._worker_batch,
+            args=(tasks, mode, strict, target_dir),
+            daemon=True,
+        ).start()
 
-    def _worker_batch(self, tasks: List[Tuple[str, str]], mode: str) -> None:
+    def _worker_batch(
+        self,
+        tasks: List[Tuple[str, str]],
+        mode: str,
+        strict: bool,
+        target_dir: str,
+    ) -> None:
         total = len(tasks)
         ok_cnt = 0
         skip_cnt = 0
+        miss_cnt = 0
         fail_cnt = 0
 
         self.after(
             0,
             lambda: self._append_batch_log(
-                f"开始批量下载，共 {total} 首（模式：{'无损优先' if mode == 'lossless_first' else '播放量优先'}）\n"
+                f"开始批量下载，共 {total} 首（模式：{'无损优先' if mode == 'lossless_first' else '播放量优先'} · {'严格匹配' if strict else '宽松匹配'}）\n"
+                f"保存目录：{target_dir}\n"
             ),
         )
 
@@ -951,35 +1095,48 @@ class BiliMusicApp(ctk.CTk):
                 raw = self.client.search_song_candidates(
                     song_name=song, artist=artist, lossless_first=(mode == "lossless_first")
                 )
-                ranked = rank_candidates(raw, song_name=song, artist=artist, mode=mode, limit=5)
+                ranked = rank_candidates(
+                    raw,
+                    song_name=song,
+                    artist=artist,
+                    mode=mode,
+                    limit=5,
+                    allow_fallback=(not strict),
+                )
                 if not ranked:
-                    fail_cnt += 1
-                    self.after(0, lambda p=prefix: self._append_batch_log(f"✗ {p} 未找到合适候选"))
-                    continue
-                best = ranked[0]
-                status, _out, detail = self._download_candidate_sync(best, song, artist, status_prefix=f"{prefix} ")
-                if status == "ok":
-                    ok_cnt += 1
-                    self.after(
-                        0,
-                        lambda p=prefix, d=detail, b=best: self._append_batch_log(
-                            f"✓ {p} {d}\n    来源：{b.title} ({b.bvid}, {format_play_count(b.play)}播放)"
-                        ),
-                    )
-                elif status == "skipped":
-                    skip_cnt += 1
-                    self.after(0, lambda p=prefix, d=detail: self._append_batch_log(f"- {p} {d}"))
-                elif status == "cancelled":
-                    self.after(0, lambda p=prefix: self._append_batch_log(f"! {p} 已取消"))
-                    break
+                    miss_cnt += 1
+                    self.after(0, lambda p=prefix: self._append_batch_log(f"⊘ {p} B站未找到匹配纯单曲，已跳过"))
                 else:
-                    fail_cnt += 1
-                    self.after(0, lambda p=prefix, d=detail: self._append_batch_log(f"✗ {p} 失败：{d}"))
+                    best = ranked[0]
+                    status, _out, detail = self._download_candidate_sync(
+                        best, song, artist, status_prefix=f"{prefix} ", target_dir=target_dir
+                    )
+                    if status == "ok":
+                        ok_cnt += 1
+                        self.after(
+                            0,
+                            lambda p=prefix, d=detail, b=best: self._append_batch_log(
+                                f"✓ {p} {d}\n    来源：{b.title} ({b.bvid}, {format_play_count(b.play)}播放)"
+                            ),
+                        )
+                    elif status == "skipped":
+                        skip_cnt += 1
+                        self.after(0, lambda p=prefix, d=detail: self._append_batch_log(f"- {p} {d}"))
+                    elif status == "cancelled":
+                        self.after(0, lambda p=prefix: self._append_batch_log(f"! {p} 已取消"))
+                        break
+                    else:
+                        fail_cnt += 1
+                        self.after(0, lambda p=prefix, d=detail: self._append_batch_log(f"✗ {p} 失败：{d}"))
             except Exception as exc:
                 fail_cnt += 1
                 self.after(0, lambda p=prefix, e=str(exc): self._append_batch_log(f"✗ {p} 异常：{e}"))
 
-        summary = f"批量任务结束：成功 {ok_cnt} 首，跳过 {skip_cnt} 首，失败 {fail_cnt} 首。"
+            # Gentle throttle between songs for large playlists to avoid Bilibili rate limits
+            if idx < total and not self._cancel_event.is_set():
+                self._cancel_event.wait(1.0)
+
+        summary = f"批量任务结束：成功 {ok_cnt} 首，跳过(已存在) {skip_cnt} 首，未搜到 {miss_cnt} 首，失败 {fail_cnt} 首。"
         self.after(0, lambda: self._append_batch_log("\n" + summary))
         self.after(0, lambda: self._finish_single_idle(summary, 100))
 

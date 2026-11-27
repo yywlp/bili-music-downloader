@@ -184,6 +184,7 @@ def rank_candidates(
     artist: str = "",
     mode: str = "lossless_first",
     limit: int = 15,
+    allow_fallback: bool = True,
 ) -> List[VideoCandidate]:
     """Filter, score, and rank Bilibili video candidates for a single song."""
     query_lower = f"{song_name} {artist}".lower()
@@ -306,6 +307,9 @@ def rank_candidates(
     valid.sort(key=lambda x: (x.score, x.play), reverse=True)
     if valid:
         return valid[:limit]
+
+    if not allow_fallback:
+        return []
 
     # Fallback: if everything was filtered out, return best excluded items marked with reason
     excluded_list.sort(key=lambda x: (x.score, x.play), reverse=True)
