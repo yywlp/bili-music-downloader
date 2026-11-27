@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Local user settings (may contain personal paths or SESSDATA)
+settings.json
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
