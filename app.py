@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import ctypes
 import os
+import random
+import subprocess
 import tempfile
 import threading
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import List, Optional, Tuple
 
 import customtkinter as ctk
 from PIL import Image
 
+from audio_player import LocalAudioPlayer
 from bili_client import BiliClient
-from config import AppSettings, get_resource_path, load_settings, save_settings
-from converter import convert_to_mp3, probe_mp3_summary, resolve_output_path, sanitize_filename
+from config import AppSettings, get_playlists_path, get_resource_path, load_settings, save_settings
+from converter import export_audio, probe_mp3_summary, resolve_output_path, sanitize_filename
 from playlist_importer import fetch_netease_playlist
-from ranker import VideoCandidate, format_play_count, rank_candidates
+from playlist_store import LocalTrack, PlaylistStore, format_size, list_track_folders, scan_local_tracks
+from ranker import VideoCandidate, format_duration, format_play_count, rank_candidates
 
 # Brand palette (Bilibili Sakura Pink + Sky Blue + Fluent Neutrals)
 PINK = "#FB7299"
@@ -30,6 +34,14 @@ LIGHT_CARD = "#FFFFFF"
 DARK_CARD = "#1E212B"
 LIGHT_BORDER = "#E5E7EB"
 DARK_BORDER = "#2E3342"
+
+PLAY_MODE_LABELS = {
+    "list_loop": "列表循环",
+    "single_loop": "单曲循环",
+    "shuffle": "随机播放",
+    "order": "顺序播放",
+}
+PLAY_MODE_ORDER = ["list_loop", "single_loop", "shuffle", "order"]
 
 
 def _setup_windows_shell() -> None:
@@ -68,7 +80,19 @@ class BiliMusicApp(ctk.CTk):
 
         self.settings: AppSettings = load_settings()
         self.client = BiliClient(sessdata=self.settings.sessdata)
+        self.playlist_store = PlaylistStore(get_playlists_path())
+        self.player = LocalAudioPlayer(
+            initial_volume=self.settings.player_volume,
+            on_track_ended=lambda: self.after(0, self._on_track_ended),
+        )
+
         self.candidates: List[VideoCandidate] = []
+        self.all_local_tracks: List[LocalTrack] = []
+        self.displayed_local_tracks: List[LocalTrack] = []
+        self.play_queue: List[LocalTrack] = []
+        self.current_play_index: int = -1
+        self._current_library_view: Tuple[str, str] = ("all", "全部本地音乐")
+
         self._busy = False
         self._cancel_event = threading.Event()
         self._last_song_query = ""
@@ -76,15 +100,19 @@ class BiliMusicApp(ctk.CTk):
         self._imported_playlist_name = ""
         self._theme_mode = "Light"
         self._logo_image: Optional[ctk.CTkImage] = None
+        self._seeking = False
+        self._last_duration = 0.0
 
         self.title("B站音乐下载器")
-        self.geometry("1120x740")
-        self.minsize(960, 640)
+        self.geometry("1160x780")
+        self.minsize(980, 660)
         self.configure(fg_color=(LIGHT_BG, DARK_BG))
 
         self._apply_window_icon()
         self._build_ui()
         self._apply_treeview_style()
+        self._refresh_local_library()
+        self._poll_player_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_window_icon(self) -> None:
@@ -117,10 +145,10 @@ class BiliMusicApp(ctk.CTk):
             border_width=1,
             border_color=(LIGHT_BORDER, DARK_BORDER),
         )
-        header.pack(fill="x", padx=18, pady=(16, 10))
+        header.pack(fill="x", padx=18, pady=(14, 8))
 
         top_row = ctk.CTkFrame(header, fg_color="transparent")
-        top_row.pack(fill="x", padx=18, pady=(14, 8))
+        top_row.pack(fill="x", padx=18, pady=(12, 6))
 
         brand_left = ctk.CTkFrame(top_row, fg_color="transparent")
         brand_left.pack(side="left")
@@ -138,7 +166,7 @@ class BiliMusicApp(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkLabel(
             title_col,
-            text="自动筛选 B站高播放无损纯单曲 · 320 kbps MP3 直出 · 自动以歌名命名",
+            text="B站无损纯单曲搜选 · 网易云歌单导入 · 高音质原流直出 · 内置歌单播放器",
             font=self.font_sub,
             text_color=("#6B7280", "#9CA3AF"),
         ).pack(anchor="w", pady=(2, 0))
@@ -149,8 +177,8 @@ class BiliMusicApp(ctk.CTk):
         self.theme_btn = ctk.CTkButton(
             tools_right,
             text="深色模式",
-            width=86,
-            height=34,
+            width=82,
+            height=32,
             corner_radius=10,
             font=self.font_small,
             fg_color=("#F3F4F6", "#2A2E3B"),
@@ -163,8 +191,8 @@ class BiliMusicApp(ctk.CTk):
         ctk.CTkButton(
             tools_right,
             text="打开目录",
-            width=86,
-            height=34,
+            width=82,
+            height=32,
             corner_radius=10,
             font=self.font_small,
             fg_color=("#EEF8FD", "#1A3242"),
@@ -176,8 +204,8 @@ class BiliMusicApp(ctk.CTk):
         ctk.CTkButton(
             tools_right,
             text="更改目录",
-            width=86,
-            height=34,
+            width=82,
+            height=32,
             corner_radius=10,
             font=self.font_small,
             fg_color=("#F3F4F6", "#2A2E3B"),
@@ -189,8 +217,8 @@ class BiliMusicApp(ctk.CTk):
         ctk.CTkButton(
             tools_right,
             text="设置",
-            width=72,
-            height=34,
+            width=68,
+            height=32,
             corner_radius=10,
             font=self.font_small,
             fg_color=("#F3F4F6", "#2A2E3B"),
@@ -199,9 +227,8 @@ class BiliMusicApp(ctk.CTk):
             command=self._open_settings_dialog,
         ).pack(side="left")
 
-        # Subtle info strip inside header
         meta_row = ctk.CTkFrame(header, fg_color=("#F8FAFC", "#181B24"), corner_radius=10)
-        meta_row.pack(fill="x", padx=18, pady=(0, 14))
+        meta_row.pack(fill="x", padx=18, pady=(0, 12))
 
         self.dir_var = tk.StringVar(value=f"保存目录：{self.settings.download_dir}")
         ctk.CTkLabel(
@@ -209,7 +236,7 @@ class BiliMusicApp(ctk.CTk):
             textvariable=self.dir_var,
             font=self.font_small,
             text_color=("#4B5563", "#9CA3AF"),
-        ).pack(side="left", padx=12, pady=6)
+        ).pack(side="left", padx=12, pady=5)
 
         ff_ok = Path(self.settings.ffmpeg_path).is_file()
         self.ff_badge = ctk.CTkLabel(
@@ -218,7 +245,16 @@ class BiliMusicApp(ctk.CTk):
             font=self.font_small,
             text_color=("#10B981", "#34D399") if ff_ok else ("#EF4444", "#F87171"),
         )
-        self.ff_badge.pack(side="right", padx=12, pady=6)
+        self.ff_badge.pack(side="right", padx=12, pady=5)
+
+        fmt_text = "输出：原流高音质 (M4A/FLAC)" if self.settings.output_format == "original" else "输出：MP3 (320k)"
+        self.fmt_badge = ctk.CTkLabel(
+            meta_row,
+            text=fmt_text,
+            font=self.font_small,
+            text_color=("#0284C7", "#7DD3FC"),
+        )
+        self.fmt_badge.pack(side="right", padx=(0, 10), pady=5)
 
         # ---------- Main Tabview ----------
         self.tabview = ctk.CTkTabview(
@@ -234,16 +270,18 @@ class BiliMusicApp(ctk.CTk):
             segmented_button_unselected_hover_color=("#E2E6EE", "#323747"),
             text_color=("#1F2937", "#F3F4F6"),
         )
-        self.tabview.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        self.tabview.pack(fill="both", expand=True, padx=18, pady=(0, 8))
         self.tabview._segmented_button.configure(font=self.font_bold)
 
         self.single_tab = self.tabview.add("  单曲搜选下载  ")
         self.batch_tab = self.tabview.add("  批量歌单下载  ")
+        self.player_tab = self.tabview.add("  本地音乐播放  ")
 
         self._build_single_tab()
         self._build_batch_tab()
+        self._build_player_tab()
 
-        # ---------- Bottom Progress Card ----------
+        # ---------- Persistent Mini Player + Download Status Footer ----------
         footer = ctk.CTkFrame(
             self,
             corner_radius=14,
@@ -251,34 +289,143 @@ class BiliMusicApp(ctk.CTk):
             border_width=1,
             border_color=(LIGHT_BORDER, DARK_BORDER),
         )
-        footer.pack(fill="x", padx=18, pady=(0, 16))
+        footer.pack(fill="x", padx=18, pady=(0, 14))
+
+        # Mini Player Row
+        player_row = ctk.CTkFrame(footer, fg_color="transparent")
+        player_row.pack(fill="x", padx=16, pady=(10, 6))
+
+        self.now_playing_var = tk.StringVar(value="未播放 · 切到「本地音乐播放」双击任意歌曲即可听歌")
+        ctk.CTkLabel(
+            player_row,
+            textvariable=self.now_playing_var,
+            font=self.font_bold,
+            text_color=("#111827", "#F9FAFB"),
+            width=260,
+            anchor="w",
+        ).pack(side="left", padx=(0, 10))
+
+        ctrl_box = ctk.CTkFrame(player_row, fg_color="transparent")
+        ctrl_box.pack(side="left", padx=(0, 12))
+
+        ctk.CTkButton(
+            ctrl_box,
+            text="⏮",
+            width=34,
+            height=30,
+            corner_radius=8,
+            fg_color=("#F3F4F6", "#2A2E3B"),
+            hover_color=("#E5E7EB", "#363C4D"),
+            text_color=("#374151", "#E5E7EB"),
+            command=self._play_prev,
+        ).pack(side="left", padx=(0, 4))
+
+        self.play_pause_btn = ctk.CTkButton(
+            ctrl_box,
+            text="▶",
+            width=40,
+            height=30,
+            corner_radius=8,
+            font=self.font_bold,
+            fg_color=PINK,
+            hover_color=PINK_HOVER,
+            command=self._toggle_play_pause,
+        )
+        self.play_pause_btn.pack(side="left", padx=(0, 4))
+
+        ctk.CTkButton(
+            ctrl_box,
+            text="⏭",
+            width=34,
+            height=30,
+            corner_radius=8,
+            fg_color=("#F3F4F6", "#2A2E3B"),
+            hover_color=("#E5E7EB", "#363C4D"),
+            text_color=("#374151", "#E5E7EB"),
+            command=self._play_next,
+        ).pack(side="left", padx=(0, 6))
+
+        self.play_mode_btn = ctk.CTkButton(
+            ctrl_box,
+            text=PLAY_MODE_LABELS.get(self.settings.play_mode, "列表循环"),
+            width=74,
+            height=30,
+            corner_radius=8,
+            font=self.font_small,
+            fg_color=("#EEF8FD", "#1A3242"),
+            hover_color=("#DCF1FB", "#224358"),
+            text_color=("#0284C7", "#7DD3FC"),
+            command=self._cycle_play_mode,
+        )
+        self.play_mode_btn.pack(side="left")
+
+        # Seek slider + time
+        self.time_cur_var = tk.StringVar(value="00:00")
+        ctk.CTkLabel(player_row, textvariable=self.time_cur_var, font=self.font_small, width=42).pack(side="left")
+
+        self.seek_slider = ctk.CTkSlider(
+            player_row,
+            from_=0,
+            to=100,
+            number_of_steps=200,
+            progress_color=PINK,
+            button_color=PINK,
+            button_hover_color=PINK_HOVER,
+        )
+        self.seek_slider.set(0)
+        self.seek_slider.pack(side="left", fill="x", expand=True, padx=6)
+        self.seek_slider.bind("<ButtonPress-1>", self._on_seek_start)
+        self.seek_slider.bind("<ButtonRelease-1>", self._on_seek_end)
+
+        self.time_tot_var = tk.StringVar(value="00:00")
+        ctk.CTkLabel(player_row, textvariable=self.time_tot_var, font=self.font_small, width=42).pack(side="left", padx=(0, 10))
+
+        # Volume
+        ctk.CTkLabel(player_row, text="🔊", font=self.font_small).pack(side="left")
+        self.vol_slider = ctk.CTkSlider(
+            player_row,
+            from_=0,
+            to=100,
+            width=88,
+            progress_color=BLUE,
+            button_color=BLUE,
+            button_hover_color=BLUE_HOVER,
+            command=self._on_volume_change,
+        )
+        self.vol_slider.set(self.settings.player_volume)
+        self.vol_slider.pack(side="left", padx=(4, 0))
+
+        # Subtle Divider + Download Progress Row
+        sep = ctk.CTkFrame(footer, height=1, fg_color=(LIGHT_BORDER, DARK_BORDER))
+        sep.pack(fill="x", padx=16, pady=(2, 6))
+
+        dl_row = ctk.CTkFrame(footer, fg_color="transparent")
+        dl_row.pack(fill="x", padx=16, pady=(0, 8))
 
         self.progress = ctk.CTkProgressBar(
-            footer,
-            height=8,
+            dl_row,
+            width=180,
+            height=7,
             corner_radius=4,
             fg_color=("#E5E7EB", "#2C3140"),
-            progress_color=PINK,
+            progress_color=BLUE,
         )
         self.progress.set(0)
-        self.progress.pack(fill="x", padx=16, pady=(12, 6))
+        self.progress.pack(side="left", padx=(0, 12))
 
-        status_row = ctk.CTkFrame(footer, fg_color="transparent")
-        status_row.pack(fill="x", padx=16, pady=(0, 10))
-
-        self.status_var = tk.StringVar(value="就绪：输入歌曲名，一键自动筛选无损纯单曲并下载为 歌曲名.mp3")
+        self.status_var = tk.StringVar(value="就绪：默认高音质原流直出 (M4A/FLAC)，无二次转码损失")
         ctk.CTkLabel(
-            status_row,
+            dl_row,
             textvariable=self.status_var,
             font=self.font_small,
-            text_color=("#4B5563", "#D1D5DB"),
+            text_color=("#6B7280", "#9CA3AF"),
         ).pack(side="left")
 
         self.cancel_btn = ctk.CTkButton(
-            status_row,
-            text="停止任务",
-            width=84,
-            height=28,
+            dl_row,
+            text="停止下载",
+            width=76,
+            height=26,
             corner_radius=8,
             font=self.font_small,
             fg_color=("#FEE2E2", "#451A1A"),
@@ -290,14 +437,13 @@ class BiliMusicApp(ctk.CTk):
         self.cancel_btn.pack(side="right")
 
     def _build_single_tab(self) -> None:
-        # Search bar row
         search_bar = ctk.CTkFrame(self.single_tab, fg_color="transparent")
-        search_bar.pack(fill="x", padx=10, pady=(8, 12))
+        search_bar.pack(fill="x", padx=10, pady=(8, 10))
 
         self.song_entry = ctk.CTkEntry(
             search_bar,
-            placeholder_text="输入歌曲名（如：青花瓷、兰亭序）",
-            width=260,
+            placeholder_text="输入歌曲名（如：用心良苦、青花瓷）",
+            width=250,
             height=38,
             corner_radius=10,
             font=self.font_body,
@@ -309,7 +455,7 @@ class BiliMusicApp(ctk.CTk):
         self.artist_entry = ctk.CTkEntry(
             search_bar,
             placeholder_text="歌手（选填）",
-            width=145,
+            width=140,
             height=38,
             corner_radius=10,
             font=self.font_body,
@@ -335,7 +481,7 @@ class BiliMusicApp(ctk.CTk):
         self.search_btn = ctk.CTkButton(
             search_bar,
             text="搜索候选",
-            width=96,
+            width=94,
             height=38,
             corner_radius=10,
             font=self.font_bold,
@@ -348,7 +494,7 @@ class BiliMusicApp(ctk.CTk):
         self.quick_btn = ctk.CTkButton(
             search_bar,
             text="一键搜并下载第1名",
-            width=158,
+            width=156,
             height=38,
             corner_radius=10,
             font=self.font_bold,
@@ -358,7 +504,6 @@ class BiliMusicApp(ctk.CTk):
         )
         self.quick_btn.pack(side="left")
 
-        # Candidate Table Container
         self.table_container = ctk.CTkFrame(
             self.single_tab,
             corner_radius=12,
@@ -366,7 +511,7 @@ class BiliMusicApp(ctk.CTk):
             border_width=1,
             border_color=(LIGHT_BORDER, DARK_BORDER),
         )
-        self.table_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.table_container.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
         inner = tk.Frame(self.table_container, bd=0, highlightthickness=0)
         inner.pack(fill="both", expand=True, padx=2, pady=2)
@@ -399,26 +544,25 @@ class BiliMusicApp(ctk.CTk):
         self.tree.bind("<Button-3>", self._show_tree_menu)
 
         self.tree_menu = tk.Menu(self, tearoff=0)
-        self.tree_menu.add_command(label="下载选中项为 MP3", command=self._download_selected)
+        self.tree_menu.add_command(label="下载选中项", command=self._download_selected)
         self.tree_menu.add_command(label="在浏览器中打开核对", command=self._open_selected_in_browser)
         self.tree_menu.add_command(label="复制视频链接", command=self._copy_selected_url)
 
-        # Action bar below table
         action_bar = ctk.CTkFrame(self.single_tab, fg_color="transparent")
-        action_bar.pack(fill="x", padx=10, pady=(0, 6))
+        action_bar.pack(fill="x", padx=10, pady=(0, 4))
 
         ctk.CTkLabel(
             action_bar,
-            text="提示：默认已按无损纯单曲规则排好序 · 双击列表项直接下载 · 右键可在浏览器核对原视频",
+            text="提示：默认已按音乐区无损纯单曲规则排好序 · 双击直接下载 · 右键可在浏览器核对原视频",
             font=self.font_small,
             text_color=("#6B7280", "#9CA3AF"),
         ).pack(side="left")
 
         self.dl_selected_btn = ctk.CTkButton(
             action_bar,
-            text="下载选中项 (MP3)",
-            width=148,
-            height=36,
+            text="下载选中项",
+            width=136,
+            height=34,
             corner_radius=10,
             font=self.font_bold,
             fg_color=PINK,
@@ -428,7 +572,6 @@ class BiliMusicApp(ctk.CTk):
         self.dl_selected_btn.pack(side="right")
 
     def _build_batch_tab(self) -> None:
-        # NetEase Playlist Import Bar
         import_bar = ctk.CTkFrame(
             self.batch_tab,
             corner_radius=12,
@@ -508,7 +651,7 @@ class BiliMusicApp(ctk.CTk):
         ).pack(side="right")
 
         split = ctk.CTkFrame(self.batch_tab, fg_color="transparent")
-        split.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        split.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         split.grid_columnconfigure(0, weight=2)
         split.grid_columnconfigure(1, weight=3)
         split.grid_rowconfigure(0, weight=1)
@@ -536,13 +679,13 @@ class BiliMusicApp(ctk.CTk):
         self.batch_log.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
         btn_bar = ctk.CTkFrame(self.batch_tab, fg_color="transparent")
-        btn_bar.pack(fill="x", padx=10, pady=(0, 6))
+        btn_bar.pack(fill="x", padx=10, pady=(0, 4))
 
         ctk.CTkButton(
             btn_bar,
             text="清空歌单",
             width=96,
-            height=36,
+            height=34,
             corner_radius=10,
             font=self.font_small,
             fg_color=("#F3F4F6", "#2A2E3B"),
@@ -555,7 +698,7 @@ class BiliMusicApp(ctk.CTk):
             btn_bar,
             text="开始批量下载",
             width=148,
-            height=36,
+            height=34,
             corner_radius=10,
             font=self.font_bold,
             fg_color=PINK,
@@ -564,6 +707,147 @@ class BiliMusicApp(ctk.CTk):
         )
         self.batch_start_btn.pack(side="right")
 
+    def _build_player_tab(self) -> None:
+        body = ctk.CTkFrame(self.player_tab, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+        body.grid_columnconfigure(0, weight=0, minsize=240)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # Left Sidebar: Library & Custom Playlists
+        sidebar = ctk.CTkFrame(
+            body,
+            width=240,
+            corner_radius=12,
+            fg_color=("#F8FAFC", "#181B24"),
+            border_width=1,
+            border_color=(LIGHT_BORDER, DARK_BORDER),
+        )
+        sidebar.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        sidebar.grid_propagate(False)
+
+        side_head = ctk.CTkFrame(sidebar, fg_color="transparent")
+        side_head.pack(fill="x", padx=10, pady=(10, 6))
+        ctk.CTkLabel(side_head, text="本地曲库与歌单", font=self.font_bold).pack(side="left")
+        ctk.CTkButton(
+            side_head,
+            text="+ 新建",
+            width=60,
+            height=26,
+            corner_radius=8,
+            font=self.font_small,
+            fg_color=PINK,
+            hover_color=PINK_HOVER,
+            command=self._create_custom_playlist,
+        ).pack(side="right")
+
+        self.sidebar_scroll = ctk.CTkScrollableFrame(sidebar, fg_color="transparent")
+        self.sidebar_scroll.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+
+        side_foot = ctk.CTkFrame(sidebar, fg_color="transparent")
+        side_foot.pack(fill="x", padx=10, pady=(0, 10))
+        self.rename_pl_btn = ctk.CTkButton(
+            side_foot,
+            text="重命名",
+            width=96,
+            height=28,
+            corner_radius=8,
+            font=self.font_small,
+            fg_color=("#EEF0F5", "#252936"),
+            hover_color=("#E2E6EE", "#323747"),
+            text_color=("#374151", "#E5E7EB"),
+            command=self._rename_current_playlist,
+            state="disabled",
+        )
+        self.rename_pl_btn.pack(side="left")
+
+        self.delete_pl_btn = ctk.CTkButton(
+            side_foot,
+            text="删除歌单",
+            width=96,
+            height=28,
+            corner_radius=8,
+            font=self.font_small,
+            fg_color=("#FEE2E2", "#451A1A"),
+            hover_color=("#FECACA", "#612424"),
+            text_color=("#DC2626", "#FCA5A5"),
+            command=self._delete_current_playlist,
+            state="disabled",
+        )
+        self.delete_pl_btn.pack(side="right")
+
+        # Right Area: Search Filter + Local Tracks Table
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+
+        top_filter = ctk.CTkFrame(right, fg_color="transparent")
+        top_filter.pack(fill="x", pady=(0, 8))
+
+        self.lib_title_var = tk.StringVar(value="全部本地音乐 (0 首)")
+        ctk.CTkLabel(top_filter, textvariable=self.lib_title_var, font=self.font_bold).pack(side="left")
+
+        ctk.CTkButton(
+            top_filter,
+            text="刷新曲库",
+            width=84,
+            height=32,
+            corner_radius=8,
+            font=self.font_small,
+            fg_color=("#F3F4F6", "#2A2E3B"),
+            hover_color=("#E5E7EB", "#363C4D"),
+            text_color=("#374151", "#E5E7EB"),
+            command=self._refresh_local_library,
+        ).pack(side="right")
+
+        self.lib_filter_entry = ctk.CTkEntry(
+            top_filter,
+            placeholder_text="筛选本地歌曲...",
+            width=210,
+            height=32,
+            corner_radius=8,
+            font=self.font_small,
+        )
+        self.lib_filter_entry.pack(side="right", padx=(0, 8))
+        self.lib_filter_entry.bind("<KeyRelease>", lambda _e: self._render_local_tracks())
+
+        table_box = ctk.CTkFrame(
+            right,
+            corner_radius=12,
+            fg_color=("#FFFFFF", "#191C25"),
+            border_width=1,
+            border_color=(LIGHT_BORDER, DARK_BORDER),
+        )
+        table_box.pack(fill="both", expand=True)
+
+        p_inner = tk.Frame(table_box, bd=0, highlightthickness=0)
+        p_inner.pack(fill="both", expand=True, padx=2, pady=2)
+        self._local_table_inner = p_inner
+
+        pcols = ("idx", "name", "fmt", "size", "folder")
+        self.local_tree = ttk.Treeview(
+            p_inner, columns=pcols, show="headings", selectmode="extended", style="Modern.Treeview"
+        )
+        self.local_tree.heading("idx", text="#")
+        self.local_tree.heading("name", text="歌曲名")
+        self.local_tree.heading("fmt", text="格式")
+        self.local_tree.heading("size", text="大小")
+        self.local_tree.heading("folder", text="所在文件夹")
+
+        self.local_tree.column("idx", width=44, anchor=tk.CENTER, stretch=False)
+        self.local_tree.column("name", width=360, anchor=tk.W, stretch=True)
+        self.local_tree.column("fmt", width=68, anchor=tk.CENTER, stretch=False)
+        self.local_tree.column("size", width=86, anchor=tk.E, stretch=False)
+        self.local_tree.column("folder", width=160, anchor=tk.W, stretch=False)
+
+        ysb2 = ttk.Scrollbar(p_inner, orient=tk.VERTICAL, command=self.local_tree.yview)
+        self.local_tree.configure(yscrollcommand=ysb2.set)
+        self.local_tree.pack(side="left", fill="both", expand=True)
+        ysb2.pack(side="right", fill="y")
+
+        self.local_tree.bind("<Double-1>", lambda _e: self._play_selected_local())
+        self.local_tree.bind("<Button-3>", self._show_local_menu)
+
+    # ---------- Styling & Theme ----------
     def _apply_treeview_style(self) -> None:
         dark = self._theme_mode == "Dark"
         bg = "#191C25" if dark else "#FFFFFF"
@@ -575,6 +859,7 @@ class BiliMusicApp(ctk.CTk):
         alt_bg = "#1E222E" if dark else "#FAFBFC"
 
         self._table_inner.configure(bg=bg)
+        self._local_table_inner.configure(bg=bg)
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure(
@@ -601,8 +886,9 @@ class BiliMusicApp(ctk.CTk):
             font=("Microsoft YaHei UI", 10, "bold"),
         )
         style.map("Modern.Treeview.Heading", background=[("active", head_bg)])
-        self.tree.tag_configure("odd", background=alt_bg)
-        self.tree.tag_configure("even", background=bg)
+        for tv in (self.tree, self.local_tree):
+            tv.tag_configure("odd", background=alt_bg)
+            tv.tag_configure("even", background=bg)
 
     def _toggle_theme(self) -> None:
         self._theme_mode = "Dark" if self._theme_mode == "Light" else "Light"
@@ -641,11 +927,12 @@ class BiliMusicApp(ctk.CTk):
         self.batch_log.configure(state="disabled")
 
     def _choose_download_dir(self) -> None:
-        chosen = filedialog.askdirectory(initialdir=self.settings.download_dir, title="选择 MP3 保存目录")
+        chosen = filedialog.askdirectory(initialdir=self.settings.download_dir, title="选择音乐保存目录")
         if chosen:
             self.settings.download_dir = chosen
             save_settings(self.settings)
             self.dir_var.set(f"保存目录：{chosen}")
+            self._refresh_local_library()
 
     def _open_download_dir(self) -> None:
         d = Path(self.settings.download_dir)
@@ -655,7 +942,7 @@ class BiliMusicApp(ctk.CTk):
     def _open_settings_dialog(self) -> None:
         win = ctk.CTkToplevel(self)
         win.title("偏好设置")
-        win.geometry("560x340")
+        win.geometry("580x390")
         win.resizable(False, False)
         win.transient(self)
         win.grab_set()
@@ -670,7 +957,20 @@ class BiliMusicApp(ctk.CTk):
         card = ctk.CTkFrame(win, corner_radius=14, fg_color=(LIGHT_CARD, DARK_CARD))
         card.pack(fill="both", expand=True, padx=16, pady=16)
 
-        ctk.CTkLabel(card, text="重名文件处理方式", font=self.font_bold).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
+        ctk.CTkLabel(card, text="输出音频格式", font=self.font_bold).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
+        fmt_map = {"original": "原流高音质 (M4A/FLAC)", "mp3": "兼容 MP3 (320k)"}
+        rev_fmt = {v: k for k, v in fmt_map.items()}
+        fmt_seg = ctk.CTkSegmentedButton(
+            card,
+            values=["原流高音质 (M4A/FLAC)", "兼容 MP3 (320k)"],
+            font=self.font_small,
+            selected_color=BLUE,
+            selected_hover_color=BLUE_HOVER,
+        )
+        fmt_seg.set(fmt_map.get(self.settings.output_format, "原流高音质 (M4A/FLAC)"))
+        fmt_seg.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 16), pady=(16, 8))
+
+        ctk.CTkLabel(card, text="重名文件处理", font=self.font_bold).grid(row=1, column=0, sticky="w", padx=16, pady=8)
         policy_map = {"rename": "自动编号", "overwrite": "直接覆盖", "skip": "跳过"}
         rev_map = {v: k for k, v in policy_map.items()}
         policy_seg = ctk.CTkSegmentedButton(
@@ -681,12 +981,12 @@ class BiliMusicApp(ctk.CTk):
             selected_hover_color=PINK_HOVER,
         )
         policy_seg.set(policy_map.get(self.settings.conflict_policy, "自动编号"))
-        policy_seg.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 16), pady=(16, 8))
+        policy_seg.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 16), pady=8)
 
-        ctk.CTkLabel(card, text="ffmpeg.exe 路径", font=self.font_bold).grid(row=1, column=0, sticky="w", padx=16, pady=8)
-        ff_entry = ctk.CTkEntry(card, width=290, height=34, corner_radius=8, font=self.font_small)
+        ctk.CTkLabel(card, text="ffmpeg.exe 路径", font=self.font_bold).grid(row=2, column=0, sticky="w", padx=16, pady=8)
+        ff_entry = ctk.CTkEntry(card, width=300, height=34, corner_radius=8, font=self.font_small)
         ff_entry.insert(0, self.settings.ffmpeg_path)
-        ff_entry.grid(row=1, column=1, sticky="ew", padx=(8, 6), pady=8)
+        ff_entry.grid(row=2, column=1, sticky="ew", padx=(8, 6), pady=8)
 
         def browse_ff() -> None:
             p = filedialog.askopenfilename(
@@ -697,24 +997,25 @@ class BiliMusicApp(ctk.CTk):
                 ff_entry.insert(0, p)
 
         ctk.CTkButton(card, text="浏览", width=64, height=34, corner_radius=8, font=self.font_small, command=browse_ff).grid(
-            row=1, column=2, padx=(0, 16), pady=8
+            row=2, column=2, padx=(0, 16), pady=8
         )
 
-        ctk.CTkLabel(card, text="B站 SESSDATA (可选)", font=self.font_bold).grid(row=2, column=0, sticky="w", padx=16, pady=8)
-        sess_entry = ctk.CTkEntry(card, width=360, height=34, corner_radius=8, font=self.font_small, show="*")
+        ctk.CTkLabel(card, text="B站 SESSDATA (可选)", font=self.font_bold).grid(row=3, column=0, sticky="w", padx=16, pady=8)
+        sess_entry = ctk.CTkEntry(card, width=370, height=34, corner_radius=8, font=self.font_small, show="*")
         sess_entry.insert(0, self.settings.sessdata)
-        sess_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 16), pady=8)
+        sess_entry.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(8, 16), pady=8)
 
         ctk.CTkLabel(
             card,
-            text="说明：程序已内置 ffmpeg.exe，不填 SESSDATA 即可直接拉取普通最高音质流转 320k MP3；若有大会员可填入解锁 FLAC。",
+            text="说明：原流高音质直出采用零重编码封装（普通流输出 .m4a，大会员 Hi-Res 流输出 .flac），避免 AAC→MP3 二次压缩失真；如需给老式车载 U 盘播放可切回 MP3。",
             font=self.font_small,
             text_color=("#6B7280", "#9CA3AF"),
-            wraplength=490,
+            wraplength=510,
             justify="left",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=16, pady=(6, 16))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=16, pady=(6, 14))
 
         def on_save() -> None:
+            self.settings.output_format = rev_fmt.get(fmt_seg.get(), "original")
             self.settings.conflict_policy = rev_map.get(policy_seg.get(), "rename")
             self.settings.ffmpeg_path = ff_entry.get().strip()
             self.settings.sessdata = sess_entry.get().strip()
@@ -725,10 +1026,13 @@ class BiliMusicApp(ctk.CTk):
                 text="● ffmpeg 内置就绪" if ff_ok else "● ffmpeg 未找到",
                 text_color=("#10B981", "#34D399") if ff_ok else ("#EF4444", "#F87171"),
             )
+            self.fmt_badge.configure(
+                text="输出：原流高音质 (M4A/FLAC)" if self.settings.output_format == "original" else "输出：MP3 (320k)"
+            )
             win.destroy()
 
         btn_row = ctk.CTkFrame(card, fg_color="transparent")
-        btn_row.grid(row=4, column=0, columnspan=3, sticky="e", padx=16, pady=(4, 16))
+        btn_row.grid(row=5, column=0, columnspan=3, sticky="e", padx=16, pady=(4, 16))
         ctk.CTkButton(
             btn_row,
             text="取消",
@@ -752,6 +1056,320 @@ class BiliMusicApp(ctk.CTk):
             command=on_save,
         ).pack(side="right")
 
+    # ---------- Local Library & Custom Playlists ----------
+    def _refresh_local_library(self) -> None:
+        self.all_local_tracks = scan_local_tracks(self.settings.download_dir)
+        self._render_sidebar()
+        self._render_local_tracks()
+
+    def _select_library_view(self, kind: str, name: str) -> None:
+        self._current_library_view = (kind, name)
+        is_custom = kind == "playlist"
+        self.rename_pl_btn.configure(state="normal" if is_custom else "disabled")
+        self.delete_pl_btn.configure(state="normal" if is_custom else "disabled")
+        self._render_sidebar()
+        self._render_local_tracks()
+
+    def _render_sidebar(self) -> None:
+        for child in self.sidebar_scroll.winfo_children():
+            child.destroy()
+
+        cur_kind, cur_name = self._current_library_view
+
+        def add_nav_btn(kind: str, name: str, label: str) -> None:
+            active = (cur_kind == kind and cur_name == name)
+            btn = ctk.CTkButton(
+                self.sidebar_scroll,
+                text=label,
+                anchor="w",
+                height=32,
+                corner_radius=8,
+                font=self.font_bold if active else self.font_small,
+                fg_color=(PINK, PINK) if active else "transparent",
+                hover_color=(PINK_HOVER, PINK_HOVER) if active else ("#E5E7EB", "#2A2E3B"),
+                text_color=("#FFFFFF", "#FFFFFF") if active else ("#374151", "#D1D5DB"),
+                command=lambda k=kind, n=name: self._select_library_view(k, n),
+            )
+            btn.pack(fill="x", padx=4, pady=2)
+
+        add_nav_btn("all", "全部本地音乐", f"🎵 全部本地音乐 ({len(self.all_local_tracks)})")
+
+        # Folders section
+        folders = list_track_folders(self.all_local_tracks)
+        if folders:
+            ctk.CTkLabel(
+                self.sidebar_scroll,
+                text="本地文件夹",
+                font=self.font_small,
+                text_color=("#9CA3AF", "#6B7280"),
+            ).pack(anchor="w", padx=8, pady=(10, 2))
+            for folder in folders:
+                cnt = sum(1 for t in self.all_local_tracks if t.folder == folder)
+                add_nav_btn("folder", folder, f"📁 {folder} ({cnt})")
+
+        # Custom playlists section
+        ctk.CTkLabel(
+            self.sidebar_scroll,
+            text="我的自定义歌单",
+            font=self.font_small,
+            text_color=("#9CA3AF", "#6B7280"),
+        ).pack(anchor="w", padx=8, pady=(10, 2))
+        playlists = self.playlist_store.list_playlists()
+        if not playlists:
+            ctk.CTkLabel(
+                self.sidebar_scroll,
+                text="暂无，点上方「+ 新建」创建",
+                font=self.font_small,
+                text_color=("#9CA3AF", "#6B7280"),
+            ).pack(anchor="w", padx=10, pady=4)
+        else:
+            for pl in playlists:
+                cnt = len(self.playlist_store.get_tracks(pl))
+                add_nav_btn("playlist", pl, f"★ {pl} ({cnt})")
+
+    def _render_local_tracks(self) -> None:
+        kind, name = self._current_library_view
+        if kind == "all":
+            source = list(self.all_local_tracks)
+        elif kind == "folder":
+            source = [t for t in self.all_local_tracks if t.folder == name]
+        else:
+            source = self.playlist_store.get_tracks(name)
+
+        kw = self.lib_filter_entry.get().strip().lower()
+        if kw:
+            filtered = [t for t in source if kw in t.name.lower() or kw in t.folder.lower()]
+        else:
+            filtered = source
+
+        self.displayed_local_tracks = filtered
+        self.lib_title_var.set(f"{name} ({len(filtered)} 首)")
+
+        for row in self.local_tree.get_children():
+            self.local_tree.delete(row)
+
+        for i, t in enumerate(filtered):
+            tag = "odd" if i % 2 else "even"
+            self.local_tree.insert(
+                "",
+                tk.END,
+                iid=str(i),
+                values=(i + 1, t.name, t.ext, format_size(t.size_bytes), t.folder),
+                tags=(tag,),
+            )
+
+    def _create_custom_playlist(self) -> Optional[str]:
+        name = simpledialog.askstring("新建歌单", "请输入新歌单名称：", parent=self)
+        if not name or not name.strip():
+            return None
+        clean = name.strip()
+        if not self.playlist_store.create_playlist(clean):
+            messagebox.showwarning("提示", f"歌单「{clean}」已存在或名称无效。")
+            return None
+        self._select_library_view("playlist", clean)
+        return clean
+
+    def _rename_current_playlist(self) -> None:
+        kind, old = self._current_library_view
+        if kind != "playlist":
+            return
+        new_name = simpledialog.askstring("重命名歌单", f"将「{old}」重命名为：", initialvalue=old, parent=self)
+        if not new_name or not new_name.strip() or new_name.strip() == old:
+            return
+        if not self.playlist_store.rename_playlist(old, new_name.strip()):
+            messagebox.showwarning("提示", "重命名失败，可能与已有歌单重名。")
+            return
+        self._select_library_view("playlist", new_name.strip())
+
+    def _delete_current_playlist(self) -> None:
+        kind, name = self._current_library_view
+        if kind != "playlist":
+            return
+        if not messagebox.askyesno("确认删除", f"确定删除自定义歌单「{name}」吗？（不会删除本地音频文件）"):
+            return
+        self.playlist_store.delete_playlist(name)
+        self._select_library_view("all", "全部本地音乐")
+
+    def _get_selected_local_tracks(self) -> List[LocalTrack]:
+        sel = self.local_tree.selection()
+        out: List[LocalTrack] = []
+        for s in sel:
+            idx = int(s)
+            if 0 <= idx < len(self.displayed_local_tracks):
+                out.append(self.displayed_local_tracks[idx])
+        return out
+
+    def _show_local_menu(self, event: tk.Event) -> None:
+        item = self.local_tree.identify_row(event.y)
+        if item and item not in self.local_tree.selection():
+            self.local_tree.selection_set(item)
+        selected = self._get_selected_local_tracks()
+        if not selected:
+            return
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="立即播放", command=self._play_selected_local)
+
+        add_sub = tk.Menu(menu, tearoff=0)
+        playlists = self.playlist_store.list_playlists()
+        for pl in playlists:
+            add_sub.add_command(
+                label=pl,
+                command=lambda p=pl, trs=selected: self._add_tracks_to_playlist(p, trs),
+            )
+        if playlists:
+            add_sub.add_separator()
+        add_sub.add_command(
+            label="+ 新建歌单并加入...",
+            command=lambda trs=selected: self._create_playlist_and_add(trs),
+        )
+        menu.add_cascade(label="添加到自定义歌单", menu=add_sub)
+
+        kind, pl_name = self._current_library_view
+        if kind == "playlist":
+            menu.add_command(
+                label=f"从「{pl_name}」移除",
+                command=lambda p=pl_name, trs=selected: self._remove_tracks_from_playlist(p, trs),
+            )
+
+        menu.add_separator()
+        menu.add_command(label="在资源管理器中定位文件", command=lambda t=selected[0]: self._reveal_in_explorer(t.path))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _add_tracks_to_playlist(self, pl_name: str, tracks: List[LocalTrack]) -> None:
+        added = self.playlist_store.add_tracks(pl_name, [t.path for t in tracks])
+        self._render_sidebar()
+        self._set_status(f"已将 {added} 首歌曲添加到歌单「{pl_name}」")
+
+    def _create_playlist_and_add(self, tracks: List[LocalTrack]) -> None:
+        name = self._create_custom_playlist()
+        if name:
+            self._add_tracks_to_playlist(name, tracks)
+            self._render_local_tracks()
+
+    def _remove_tracks_from_playlist(self, pl_name: str, tracks: List[LocalTrack]) -> None:
+        removed = self.playlist_store.remove_tracks(pl_name, [t.path for t in tracks])
+        self._render_sidebar()
+        self._render_local_tracks()
+        self._set_status(f"已从歌单「{pl_name}」移除 {removed} 首歌曲")
+
+    def _reveal_in_explorer(self, path: str) -> None:
+        if os.name == "nt" and Path(path).exists():
+            subprocess.Popen(["explorer", "/select,", path])
+
+    # ---------- Audio Player Controls ----------
+    def _play_selected_local(self) -> None:
+        sel = self.local_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self.displayed_local_tracks):
+            self.play_queue = list(self.displayed_local_tracks)
+            self._play_queue_index(idx)
+
+    def _play_queue_index(self, idx: int) -> None:
+        if not self.play_queue or idx < 0 or idx >= len(self.play_queue):
+            return
+        self.current_play_index = idx
+        track = self.play_queue[idx]
+        if not Path(track.path).is_file():
+            self._set_status(f"文件不存在：{track.name}")
+            return
+        self._last_duration = 0.0
+        self.seek_slider.set(0)
+        self.time_cur_var.set("00:00")
+        self.time_tot_var.set("00:00")
+        self.now_playing_var.set(f"♪ {track.name}  [{track.ext}]")
+        self.play_pause_btn.configure(text="⏸")
+        self.player.play_file(track.path)
+
+    def _toggle_play_pause(self) -> None:
+        snap = self.player.get_snapshot()
+        if not snap.current_path:
+            if self.displayed_local_tracks:
+                self.play_queue = list(self.displayed_local_tracks)
+                self._play_queue_index(0)
+            return
+        self.player.toggle_pause()
+
+    def _play_next(self) -> None:
+        if not self.play_queue:
+            return
+        mode = self.settings.play_mode
+        if mode == "shuffle" and len(self.play_queue) > 1:
+            choices = [i for i in range(len(self.play_queue)) if i != self.current_play_index]
+            nxt = random.choice(choices)
+        else:
+            nxt = (self.current_play_index + 1) % len(self.play_queue)
+        self._play_queue_index(nxt)
+
+    def _play_prev(self) -> None:
+        if not self.play_queue:
+            return
+        prev_idx = (self.current_play_index - 1) % len(self.play_queue)
+        self._play_queue_index(prev_idx)
+
+    def _on_track_ended(self) -> None:
+        if not self.play_queue:
+            return
+        mode = self.settings.play_mode
+        if mode == "single_loop":
+            self._play_queue_index(self.current_play_index)
+        elif mode == "shuffle":
+            if len(self.play_queue) > 1:
+                choices = [i for i in range(len(self.play_queue)) if i != self.current_play_index]
+                self._play_queue_index(random.choice(choices))
+            else:
+                self._play_queue_index(0)
+        elif mode == "list_loop":
+            self._play_queue_index((self.current_play_index + 1) % len(self.play_queue))
+        else:  # "order"
+            if self.current_play_index + 1 < len(self.play_queue):
+                self._play_queue_index(self.current_play_index + 1)
+            else:
+                self.play_pause_btn.configure(text="▶")
+
+    def _cycle_play_mode(self) -> None:
+        cur = self.settings.play_mode
+        idx = (PLAY_MODE_ORDER.index(cur) + 1) % len(PLAY_MODE_ORDER) if cur in PLAY_MODE_ORDER else 0
+        new_mode = PLAY_MODE_ORDER[idx]
+        self.settings.play_mode = new_mode
+        save_settings(self.settings)
+        self.play_mode_btn.configure(text=PLAY_MODE_LABELS[new_mode])
+
+    def _on_seek_start(self, _event: tk.Event) -> None:
+        self._seeking = True
+
+    def _on_seek_end(self, _event: tk.Event) -> None:
+        if self._last_duration > 0:
+            target_sec = (self.seek_slider.get() / 100.0) * self._last_duration
+            self.player.seek(target_sec)
+            self.time_cur_var.set(format_duration(int(target_sec)))
+        self._seeking = False
+
+    def _on_volume_change(self, val: float) -> None:
+        vol = int(round(val))
+        self.settings.player_volume = vol
+        self.player.set_volume(vol)
+
+    def _poll_player_ui(self) -> None:
+        snap = self.player.get_snapshot()
+        if snap.state == "playing":
+            self.play_pause_btn.configure(text="⏸")
+        else:
+            self.play_pause_btn.configure(text="▶")
+
+        if snap.duration_sec > 0:
+            self._last_duration = snap.duration_sec
+            self.time_tot_var.set(format_duration(int(snap.duration_sec)))
+            if not self._seeking:
+                self.time_cur_var.set(format_duration(int(snap.position_sec)))
+                pct = max(0.0, min(100.0, (snap.position_sec / snap.duration_sec) * 100.0))
+                self.seek_slider.set(pct)
+
+        self.after(250, self._poll_player_ui)
+
+    # ---------- Single Search Tree Menu ----------
     def _show_tree_menu(self, event: tk.Event) -> None:
         item = self.tree.identify_row(event.y)
         if item:
@@ -786,6 +1404,11 @@ class BiliMusicApp(ctk.CTk):
 
     def _on_close(self) -> None:
         self._cancel_event.set()
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        self.player.shutdown()
         self.destroy()
 
     # ---------- Single Search & Download ----------
@@ -802,7 +1425,7 @@ class BiliMusicApp(ctk.CTk):
         self._last_artist_query = artist
         self._cancel_event.clear()
         self._set_busy(True)
-        self._set_status(f"正在 Bilibili 搜索《{song}》并筛选最佳无损纯单曲...", 15)
+        self._set_status(f"正在 Bilibili 音乐区搜索《{song}》并筛选最佳无损纯单曲...", 15)
 
         mode = self._current_rank_mode()
         threading.Thread(
@@ -900,17 +1523,20 @@ class BiliMusicApp(ctk.CTk):
         status_prefix: str = "",
         target_dir: Optional[str] = None,
     ) -> Tuple[str, Optional[Path], str]:
+        self.after(0, lambda: self._set_status(f"{status_prefix}正在解析最高音质音频流 ({candidate.bvid})...", 20))
+        info = self.client.get_video_info(candidate.bvid)
+        stream = self.client.get_best_audio_stream(candidate.bvid, info["cid"])
+
+        out_fmt = self.settings.output_format
+        ext = ".mp3" if out_fmt == "mp3" else str(stream.get("ext") or ".m4a")
         out_path, skipped = resolve_output_path(
             target_dir or self.settings.download_dir,
             song_name,
             conflict_policy=self.settings.conflict_policy,
+            ext=ext,
         )
         if skipped:
             return "skipped", out_path, f"文件已存在，已跳过：{out_path.name}"
-
-        self.after(0, lambda: self._set_status(f"{status_prefix}正在解析音频流 ({candidate.bvid})...", 20))
-        info = self.client.get_video_info(candidate.bvid)
-        stream = self.client.get_best_audio_stream(candidate.bvid, info["cid"])
 
         tmp_dir = Path(tempfile.gettempdir()) / "bili_music_dl"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -939,11 +1565,14 @@ class BiliMusicApp(ctk.CTk):
             if self._cancel_event.is_set():
                 return "cancelled", None, "已取消"
 
-            self.after(0, lambda: self._set_status(f"{status_prefix}正在转码为 320k MP3...", 85))
-            ok, msg = convert_to_mp3(
+            action_label = "无损封装原流" if out_fmt == "original" else "转码为 320k MP3"
+            self.after(0, lambda: self._set_status(f"{status_prefix}正在{action_label}...", 85))
+            ok, msg = export_audio(
                 ffmpeg_path=self.settings.ffmpeg_path,
                 input_path=tmp_file,
                 output_path=out_path,
+                output_format=out_fmt,
+                is_flac=bool(stream.get("is_flac")),
                 title=song_name,
                 artist=artist_name or candidate.author,
                 bitrate=self.settings.bitrate,
@@ -953,7 +1582,7 @@ class BiliMusicApp(ctk.CTk):
 
             summary = probe_mp3_summary(self.settings.ffmpeg_path, out_path)
             size_mb = out_path.stat().st_size / (1024 * 1024)
-            quality_tag = "FLAC源" if stream.get("is_flac") else f"流{stream.get('id')}"
+            quality_tag = "FLAC真无损" if stream.get("is_flac") else ("原流直出" if out_fmt == "original" else f"MP3/流{stream.get('id')}")
             detail = f"已保存：{out_path.name} ({size_mb:.2f} MB · {quality_tag}" + (f" · {summary})" if summary else ")")
             return "ok", out_path, detail
         except InterruptedError:
@@ -970,6 +1599,7 @@ class BiliMusicApp(ctk.CTk):
             return
 
         if status == "ok":
+            self.after(0, self._refresh_local_library)
             self.after(0, lambda: self._finish_single_idle(f"下载完成！{detail}", 100))
         elif status == "skipped":
             self.after(0, lambda: self._finish_single_idle(detail, 100))
@@ -1132,11 +1762,11 @@ class BiliMusicApp(ctk.CTk):
                 fail_cnt += 1
                 self.after(0, lambda p=prefix, e=str(exc): self._append_batch_log(f"✗ {p} 异常：{e}"))
 
-            # Gentle throttle between songs for large playlists to avoid Bilibili rate limits
             if idx < total and not self._cancel_event.is_set():
                 self._cancel_event.wait(1.0)
 
         summary = f"批量任务结束：成功 {ok_cnt} 首，跳过(已存在) {skip_cnt} 首，未搜到 {miss_cnt} 首，失败 {fail_cnt} 首。"
+        self.after(0, self._refresh_local_library)
         self.after(0, lambda: self._append_batch_log("\n" + summary))
         self.after(0, lambda: self._finish_single_idle(summary, 100))
 

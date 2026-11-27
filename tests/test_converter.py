@@ -42,6 +42,13 @@ class TestConverter(unittest.TestCase):
             self.assertEqual(p_over.name, "半壶纱.mp3")
             self.assertFalse(skipped_over)
 
+            p_m4a, skipped_m4a = resolve_output_path(tmp, "半壶纱", conflict_policy="rename", ext=".m4a")
+            self.assertEqual(p_m4a.name, "半壶纱.m4a")
+            self.assertFalse(skipped_m4a)
+            p_m4a.write_bytes(b"fake")
+            p_m4a2, _ = resolve_output_path(tmp, "半壶纱", conflict_policy="rename", ext=".m4a")
+            self.assertEqual(p_m4a2.name, "半壶纱 (2).m4a")
+
 
 if __name__ == "__main__":
     unittest.main()

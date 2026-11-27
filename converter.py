@@ -123,6 +123,76 @@ def convert_to_mp3(
     return True, "OK"
 
 
+def export_audio(
+    ffmpeg_path: str | Path,
+    input_path: str | Path,
+    output_path: str | Path,
+    output_format: str = "original",
+    is_flac: bool = False,
+    title: str = "",
+    artist: str = "",
+    bitrate: str = "320k",
+) -> Tuple[bool, str]:
+    """
+    Export downloaded DASH audio stream:
+    - output_format == 'original': remux losslessly via -c:a copy to .m4a or .flac (zero generation loss)
+    - output_format == 'mp3': transcode to 320k MP3 via libmp3lame
+    """
+    if output_format == "mp3":
+        return convert_to_mp3(
+            ffmpeg_path=ffmpeg_path,
+            input_path=input_path,
+            output_path=output_path,
+            title=title,
+            artist=artist,
+            bitrate=bitrate,
+        )
+
+    ff = Path(ffmpeg_path)
+    if not ff.is_file():
+        return False, f"未找到 ffmpeg.exe: {ff}"
+
+    meta_args = []
+    if title:
+        meta_args += ["-metadata", f"title={title}"]
+    if artist:
+        meta_args += ["-metadata", f"artist={artist}"]
+
+    out = Path(output_path)
+    if is_flac or out.suffix.lower() == ".flac":
+        cmd_copy = [
+            str(ff), "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(input_path), "-vn", "-c:a", "copy",
+            *meta_args, str(out),
+        ]
+        proc = subprocess.run(cmd_copy, capture_output=True, text=True, encoding="utf-8", errors="replace", **_subprocess_kwargs())
+        if proc.returncode != 0:
+            # Fallback to lossless FLAC re-encode if container copy fails
+            cmd_flac = [
+                str(ff), "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(input_path), "-vn", "-c:a", "flac",
+                *meta_args, str(out),
+            ]
+            proc = subprocess.run(cmd_flac, capture_output=True, text=True, encoding="utf-8", errors="replace", **_subprocess_kwargs())
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip()
+                return False, f"ffmpeg FLAC 封装失败 (code={proc.returncode}): {err}"
+    else:
+        cmd_m4a = [
+            str(ff), "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(input_path), "-vn", "-c:a", "copy", "-f", "mp4", "-movflags", "+faststart",
+            *meta_args, str(out),
+        ]
+        proc = subprocess.run(cmd_m4a, capture_output=True, text=True, encoding="utf-8", errors="replace", **_subprocess_kwargs())
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            return False, f"ffmpeg M4A 封装失败 (code={proc.returncode}): {err}"
+
+    if not out.is_file() or out.stat().st_size == 0:
+        return False, "封装完成但输出音频文件为空"
+    return True, "OK"
+
+
 def probe_mp3_summary(ffmpeg_path: str | Path, mp3_path: str | Path) -> str:
     ff = Path(ffmpeg_path)
     if not ff.is_file():

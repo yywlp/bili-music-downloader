@@ -32,6 +32,10 @@ def get_settings_path() -> Path:
     return appdata / "settings.json"
 
 
+def get_playlists_path() -> Path:
+    return get_settings_path().parent / "playlists.json"
+
+
 def get_resource_path(rel_path: str) -> Path:
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
@@ -84,8 +88,11 @@ class AppSettings:
     ffmpeg_path: str = ""
     rank_mode: str = "lossless_first"  # "lossless_first" | "views_first"
     conflict_policy: str = "rename"    # "rename" | "overwrite" | "skip"
+    output_format: str = "original"    # "original" (M4A/FLAC) | "mp3" (320k)
     bitrate: str = "320k"
     sessdata: str = ""
+    player_volume: int = 80            # 0..100
+    play_mode: str = "list_loop"       # "order" | "list_loop" | "single_loop" | "shuffle"
 
     def ensure_defaults(self) -> "AppSettings":
         if not self.download_dir:
@@ -101,8 +108,13 @@ class AppSettings:
             self.rank_mode = "lossless_first"
         if self.conflict_policy not in ("rename", "overwrite", "skip"):
             self.conflict_policy = "rename"
+        if self.output_format not in ("original", "mp3"):
+            self.output_format = "original"
         if not self.bitrate:
             self.bitrate = "320k"
+        self.player_volume = max(0, min(100, int(self.player_volume)))
+        if self.play_mode not in ("order", "list_loop", "single_loop", "shuffle"):
+            self.play_mode = "list_loop"
         return self
 
 

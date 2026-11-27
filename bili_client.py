@@ -285,7 +285,25 @@ class BiliClient:
                 "url": flac_audio.get("baseUrl") or flac_audio.get("base_url"),
                 "backup_urls": flac_audio.get("backupUrl") or flac_audio.get("backup_url") or [],
                 "is_flac": True,
+                "is_dolby": False,
+                "ext": ".flac",
             }
+
+        dolby = dash.get("dolby") or {}
+        dolby_audios = dolby.get("audio") or []
+        if isinstance(dolby_audios, list) and dolby_audios:
+            best_dolby = max(dolby_audios, key=lambda a: int(a.get("bandwidth") or 0))
+            if best_dolby.get("baseUrl") or best_dolby.get("base_url"):
+                return {
+                    "id": best_dolby.get("id", 30250),
+                    "bandwidth": int(best_dolby.get("bandwidth") or 0),
+                    "codecs": str(best_dolby.get("codecs") or "ec-3"),
+                    "url": best_dolby.get("baseUrl") or best_dolby.get("base_url"),
+                    "backup_urls": best_dolby.get("backupUrl") or best_dolby.get("backup_url") or [],
+                    "is_flac": False,
+                    "is_dolby": True,
+                    "ext": ".m4a",
+                }
 
         audios = dash.get("audio") or []
         if not audios:
@@ -299,6 +317,8 @@ class BiliClient:
             "url": best.get("baseUrl") or best.get("base_url"),
             "backup_urls": best.get("backupUrl") or best.get("backup_url") or [],
             "is_flac": False,
+            "is_dolby": False,
+            "ext": ".m4a",
         }
 
     def download_stream(
