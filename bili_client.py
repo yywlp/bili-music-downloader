@@ -41,7 +41,7 @@ def _enc_wbi(params: Dict[str, str | int], img_key: str, sub_key: str) -> Dict[s
         k: "".join(ch for ch in str(v) if ch not in "!'()*")
         for k, v in signed.items()
     }
-    query = urllib.parse.urlencode(filtered)
+    query = urllib.parse.urlencode(filtered, quote_via=urllib.parse.quote)
     w_rid = hashlib.md5((query + mixin_key).encode("utf-8")).hexdigest()
     filtered["w_rid"] = w_rid
     return filtered
@@ -158,15 +158,19 @@ class BiliClient:
         if self._wbi_keys:
             try:
                 signed = _enc_wbi(base_params, self._wbi_keys[0], self._wbi_keys[1])
-                url = "https://api.bilibili.com/x/web-interface/wbi/search/type?" + urllib.parse.urlencode(signed)
+                url = "https://api.bilibili.com/x/web-interface/wbi/search/type?" + urllib.parse.urlencode(
+                    signed, quote_via=urllib.parse.quote
+                )
                 resp = self._get_json(url, referer="https://search.bilibili.com/")
-                if resp.get("code") == 0:
+                if resp.get("code") == 0 and (resp.get("data") or {}).get("result"):
                     data = resp.get("data") or {}
             except Exception:
                 data = None
 
         if data is None:
-            url = "https://api.bilibili.com/x/web-interface/search/type?" + urllib.parse.urlencode(base_params)
+            url = "https://api.bilibili.com/x/web-interface/search/type?" + urllib.parse.urlencode(
+                base_params, quote_via=urllib.parse.quote
+            )
             resp = self._get_json(url, referer="https://search.bilibili.com/")
             if resp.get("code") != 0:
                 raise RuntimeError(f"B站搜索接口返回异常: code={resp.get('code')} msg={resp.get('message')}")
@@ -209,11 +213,12 @@ class BiliClient:
         lossless_first: bool = True,
     ) -> List[VideoCandidate]:
         song_name = song_name.strip()
-        artist = artist.strip()
+        # Use primary artist only for search query (e.g. "张学友 / 郑中基" -> "张学友")
+        search_artist = artist.split("/")[0].strip() if artist else ""
         if not song_name:
             return []
 
-        primary_kw = f"{song_name} {artist}".strip()
+        primary_kw = f"{song_name} {search_artist}".strip()
         results: List[VideoCandidate] = []
 
         # 1. Music partition (tids=3) sorted by most views & default relevance
@@ -225,13 +230,20 @@ class BiliClient:
 
         # 2. Lossless-specific relevance search (catches Hi-Res uploads even for common idiom titles)
         if lossless_first:
-            lossless_kw = f"{song_name} {artist} 无损".strip() if artist else f"{song_name} 无损"
+            lossless_kw = f"{song_name} {search_artist} 无损".strip() if search_artist else f"{song_name} 无损"
             try:
                 results.extend(self._search_once(lossless_kw, order="totalrank", page=1))
             except Exception:
                 pass
 
-        # 3. Fallback to site-wide relevance search only if music partition returned nothing
+        # 3. If searching with artist returned nothing, retry with song name only in music partition
+        if not results and search_artist:
+            try:
+                results.extend(self._search_once(song_name, order="totalrank", page=1, tids=3))
+            except Exception:
+                pass
+
+        # 4. Fallback to site-wide relevance search only if music partition returned nothing
         if not results:
             results.extend(self._search_once(primary_kw, order="totalrank", page=1))
         return results

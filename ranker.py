@@ -336,9 +336,11 @@ def rank_candidates(
         if norm_artist:
             norm_title = normalize_for_match(clean_title)
             norm_author = normalize_for_match(c.author)
-            if norm_artist in norm_title or norm_artist in norm_author:
+            artist_parts = [normalize_for_match(p) for p in re.split(r"[/、,&，]+", artist) if p.strip()]
+            artist_parts = [p for p in artist_parts if p] or [norm_artist]
+            if any(p in norm_title or p in norm_author for p in artist_parts):
                 score += 12.0
-                if norm_author == norm_artist:
+                if any(norm_author == p for p in artist_parts):
                     score += 5.0
                     if "原唱号" not in c.badges:
                         c.badges.append("原唱号")
