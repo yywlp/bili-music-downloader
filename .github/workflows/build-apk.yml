@@ -1,0 +1,77 @@
+name: Build & Release Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'android/**'
+      - '.github/workflows/build-apk.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Run unit tests & build APK
+        working-directory: android
+        run: gradle testDebugUnitTest assembleDebug --no-daemon
+
+      - name: Prepare APK output
+        shell: bash
+        run: |
+          mkdir -p release-out
+          TAG_NAME="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            APK_NAME="BiliMusic-Android-${TAG_NAME}.apk"
+          else
+            APK_NAME="BiliMusic-Android-v2.2.0.apk"
+          fi
+          cp android/app/build/outputs/apk/debug/app-debug.apk "release-out/${APK_NAME}"
+          echo "APK_PATH=release-out/${APK_NAME}" >> "$GITHUB_ENV"
+          ls -lh release-out/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliMusic-Android-APK
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: ${{ env.APK_PATH }}
+          body: |
+            ## BiliMusic Android ${{ github.ref_name }}
+
+            ### 主要功能
+            - 纯单曲智能过滤与打分排序（无损优先 / 播放量优先，自动过滤合集、翻唱、鬼畜、1小时循环）
+            - 点击歌曲卡片展开「去B站核对」与「下载 MP3」按钮，防误触
+            - 网易云音乐歌单免登录导入（支持分享文案/短链/歌单 ID、按歌单名建子文件夹、严格匹配防乱下）
+            - 内置本地音乐库 + 自定义歌单（新建/重命名/删除、安全删除本地文件）
+            - 常驻底部迷你播放器（4 种播放模式、上下首、进度拖拽、**蓝牙/耳机断开自动暂停**）
+            - 浅色 / 深色双主题 + 自适应渐变图标
+
+            > 直接下载下方 `.apk` 安装到 Android 8.0+ 手机即可使用。

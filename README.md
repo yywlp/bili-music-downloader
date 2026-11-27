@@ -55,10 +55,22 @@ python app.py
 python -m unittest discover -s tests -v
 ```
 
+## Android 原生客户端（`android/`）
+
+已同步提供基于 **Kotlin + Jetpack Compose (Material 3)** 开发的独立安卓客户端，完整移植桌面版核心功能：
+- 纯单曲过滤与打分排序 + 点击歌曲展开「去B站核对」「下载 MP3」防误触交互；
+- 网易云歌单免登录导入 + 按歌单建子文件夹 + 严格匹配；
+- 本地音乐库扫描 + 自定义歌单（新建/重命名/删除）+ 安全删除本地文件；
+- 常驻底部迷你播放器（4 种播放模式、拖拽进度、**蓝牙/耳机断开自动暂停**）。
+
+直接前往本仓库右侧 **[Releases](https://github.com/yywlp/bili-music-downloader/releases)** 下载最新 `BiliMusic-Android-*.apk` 安装即可（Android 8.0+）。
+
 ## 项目结构
 
 ```text
 bili-music-downloader/
+├── android/              # 原生 Kotlin + Jetpack Compose 安卓客户端工程
+├── .github/workflows/    # GitHub Actions 自动编译与发布 APK Release
 ├── app.py                # CustomTkinter 桌面主界面
 ├── bili_client.py        # B站会话初始化、WBI 签名搜索与音频流下载
 ├── ranker.py             # 纯单曲筛选与打分引擎
