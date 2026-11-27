@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 Write-Output "Checking PyInstaller..."
@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $ffmpegSrc)) {
 $iconSrc = Join-Path $PSScriptRoot "assets\app.ico"
 $assetsDir = Join-Path $PSScriptRoot "assets"
 
-Write-Output "Building fully standalone BiliMusicDownloader.exe (with bundled ffmpeg.exe + custom icon + modern UI)..."
+Write-Output "Building fully standalone B站音乐下载器.exe (with bundled ffmpeg.exe + custom icon + modern UI)..."
 python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -31,10 +31,10 @@ python -m PyInstaller `
     --add-binary "${ffmpegSrc};." `
     --add-data "${assetsDir};assets" `
     --collect-data customtkinter `
-    --name "BiliMusicDownloader" `
+    --name "B站音乐下载器" `
     app.py
 
-$exePath = Join-Path $PSScriptRoot "dist\BiliMusicDownloader.exe"
+$exePath = Join-Path $PSScriptRoot "dist\B站音乐下载器.exe"
 if (-not (Test-Path -LiteralPath $exePath)) {
     throw "Build failed: $exePath not found"
 }

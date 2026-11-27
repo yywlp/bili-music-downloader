@@ -77,7 +77,7 @@ class BiliMusicApp(ctk.CTk):
         self._theme_mode = "Light"
         self._logo_image: Optional[ctk.CTkImage] = None
 
-        self.title("BiliMusic · Bilibili 纯单曲 MP3 下载器")
+        self.title("B站音乐下载器")
         self.geometry("1120x740")
         self.minsize(960, 640)
         self.configure(fg_color=(LIGHT_BG, DARK_BG))
@@ -132,7 +132,7 @@ class BiliMusicApp(ctk.CTk):
         title_col.pack(side="left")
         ctk.CTkLabel(
             title_col,
-            text="BiliMusic 音乐下载器",
+            text="B站音乐下载器",
             font=self.font_title,
             text_color=("#111827", "#F9FAFB"),
         ).pack(anchor="w")
